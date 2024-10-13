@@ -1,0 +1,333 @@
+#include <Arduino.h>
+#include <ArduinoJson.h>
+#include <WiFi.h>
+#include <esp_task_wdt.h>
+#include <nvs_flash.h>
+#include <nvs.h>
+//#include "ShaTests/nerdSHA256.h"
+#include "ShaTests/nerdSHA256plus.h"
+#include "stratum.h"
+#include "mining.h"
+#include "utils.h"
+#include "monitor.h"
+#include "timeconst.h"
+#include "drivers/displays/display.h"
+#include "drivers/storage/storage.h"
+
+#include "drivers/nerd-nos/nerdnos.h"
+#include "mining_nerdnos.h"
+#include "drivers/nerd-nos/adc.h"
+#include "drivers/nerd-nos/bm1397.h"
+
+extern WiFiClient client;
+extern mining_subscribe mWorker;
+extern mining_job mJob;
+extern miner_data mMiner;
+extern monitor_data mMonitor;
+
+extern pthread_mutex_t job_mutex;
+extern double best_diff;
+extern unsigned long mLastTXtoPool;
+
+#define REQUEST_ASIC_HASHRATE
+
+// we can have 32 different job ids
+#define ASIC_JOB_COUNT 32
+
+// to track the jobs
+static bm_job_t asic_jobs[ASIC_JOB_COUNT] = {0};
+
+static pthread_mutex_t asic_job_mutexes[ASIC_JOB_COUNT];
+
+// to track hashrate
+#define ASIC_HISTORY_SIZE 128
+
+// define temperature readings
+#define MAX_SAFE_TEMP 80.0  // Define maximum safe temperature (in Celsius)
+#define TEMP_CHECK_INTERVAL 5000  // Check temperature every 5 seconds (in milliseconds)
+
+typedef struct {
+  uint32_t diffs[ASIC_HISTORY_SIZE];
+  uint32_t timestamps[ASIC_HISTORY_SIZE];
+  uint32_t newest;
+  uint32_t oldest;
+  uint64_t sum;
+  double avg_gh;
+  double duration;
+  int shares;
+} history_t;
+
+static pthread_mutex_t job_interval_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t job_interval_cond = PTHREAD_COND_INITIALIZER;
+
+static volatile uint32_t version = 0x20000000;
+
+history_t history = {0};
+
+static uint32_t last_request_hashrate_ts = 0;
+
+double nerdnos_get_avg_hashrate() {
+  return history.avg_gh;
+}
+
+static void safe_free_job(bm_job_t *job) {
+  if (job && job->ntime) {
+    nerdnos_free_bm_job(job);
+    job->ntime = 0;  // Only clear the ntime pointer to mark it free
+  }
+}
+
+// incremental ringbuffer based hashrate calculation
+static void calculate_hashrate(history_t *history, uint32_t diff) {
+  // if we have wrapped around at least once our ringbuffer is full
+  // and we have to remove the oldest element
+  if (history->newest + 1 >= ASIC_HISTORY_SIZE) {
+    history->sum -= history->diffs[history->oldest % ASIC_HISTORY_SIZE];
+    history->oldest++;
+  }
+  // add and store the newest sample
+  history->sum += diff;
+  history->diffs[history->newest % ASIC_HISTORY_SIZE] = diff;
+
+  history->timestamps[history->newest % ASIC_HISTORY_SIZE] = millis();
+
+  uint32_t oldest_timestamp = history->timestamps[history->oldest % ASIC_HISTORY_SIZE];
+  uint32_t newest_timestamp = history->timestamps[history->newest % ASIC_HISTORY_SIZE];
+
+  history->duration = (double) (newest_timestamp - oldest_timestamp) / 1.0e3;
+  history->shares = (int) history->newest - (int) history->oldest + 1;
+
+  if (history->duration) {
+    double avg = (double) (history->sum << 32llu) / history->duration;
+    history->avg_gh = avg / 1.0e9;
+  }
+
+  history->newest++;
+}
+
+// triggers the job creation
+static void create_job_timer(TimerHandle_t xTimer)
+{
+    pthread_mutex_lock(&job_interval_mutex);
+    pthread_cond_signal(&job_interval_cond);
+    pthread_mutex_unlock(&job_interval_mutex);
+}
+
+static void process_hashrate_response(task_result *result) {
+  static float hashrate_long = 0.0;
+  static float hashrate_short = 0.0;
+
+  // hashrate reported by chip
+  float hr_gh = (float) ((uint64_t) (result->data & 0x7fffffff) << 20llu) / 1.0e9;
+
+  if (result->data & 0x80000000) {
+    hashrate_long = hr_gh;
+  } else {
+    hashrate_short = hr_gh;
+  }
+
+  Serial.printf("hashrate reported by asic: %.3fGH (short), %.3fGH (long)\n", hashrate_short, hashrate_long);
+}
+
+void runASIC_RX(void * task_id) {
+  while (1) {
+    task_result result = {0};
+    if (!nerdnos_proccess_work(version, 10000, &result)) {
+      continue;
+    }
+
+    if (result.is_reg_resp) {
+      switch (result.reg) {
+        case 0x04: {
+          process_hashrate_response(&result);
+          break;
+        }
+      }
+      continue;
+    }
+    // check if the ID is in the valid range and the slot is not empty
+    if (result.job_id >= ASIC_JOB_COUNT) {
+      Serial.printf("Invalid job ID %02x\n", result.job_id);
+      continue;
+    }
+    pthread_mutex_lock(&asic_job_mutexes[result.job_id]);
+
+    // check if the ID is in the valid range and the slot is not empty
+    if (!asic_jobs[result.job_id].ntime) {
+      Serial.printf("No job found for ID %02x\n", result.job_id);
+      pthread_mutex_unlock(&asic_job_mutexes[result.job_id]);
+      continue;
+    }
+
+    uint8_t hash[32];
+
+    // check the nonce difficulty
+    double diff_hash = nerdnos_test_nonce_value(
+        &asic_jobs[result.job_id],
+        result.nonce,
+        result.rolled_version,
+        hash);
+
+    // update best diff
+    if (diff_hash > best_diff) {
+      best_diff = diff_hash;
+    }
+
+    // calculate the hashrate
+    if (diff_hash >= asic_jobs[result.job_id].pool_diff) {
+      calculate_hashrate(&history, asic_jobs[result.job_id].pool_diff);
+      Serial.printf("avg hashrate: %.2fGH/s (history spans %.2fs, %d shares)\n", history.avg_gh, history.duration, history.shares);
+    }
+
+    if(diff_hash > mMiner.poolDifficulty)
+    {
+      tx_mining_submit_asic(client, mWorker, &asic_jobs[result.job_id], &result);
+      Serial.println("valid share!");
+      Serial.printf("   - Current diff share: %.3f\n", diff_hash);
+      Serial.printf("   - Current pool diff : %.3f\n", mMiner.poolDifficulty);
+      Serial.printf("Free heap after share: %u bytes\n", ESP.getFreeHeap());
+      for (size_t i = 0; i < 32; i++) {
+          Serial.printf("%02x", hash[i]);
+      }
+      Serial.println();
+#ifdef DEBUG_MINING
+      Serial.print("   - Current nonce: "); Serial.println(nonce);
+      Serial.print("   - Current block header: ");
+      for (size_t i = 0; i < 80; i++) {
+          Serial.printf("%02x", mMiner.bytearray_blockheader[i]);
+      }
+      Serial.println();
+#endif
+
+      mLastTXtoPool = millis();
+    }
+    pthread_mutex_unlock(&asic_job_mutexes[result.job_id]);
+  }
+}
+
+void runASIC(void * task_id) {
+  Serial.printf("[MINER] Started runASIC Task!\n");
+
+  for (int i=0;i<ASIC_JOB_COUNT;i++) {
+    asic_job_mutexes[i] = PTHREAD_MUTEX_INITIALIZER;
+  }
+
+  // Create the timer
+  TimerHandle_t job_timer = xTimerCreate("NERDNOS_Job_Timer", NERDNOS_JOB_INTERVAL_MS / portTICK_PERIOD_MS, pdTRUE, NULL, create_job_timer);
+
+  if (job_timer == NULL) {
+      Serial.println("Failed to create NERDNOS timer");
+      return;
+  }
+
+  // Start the timer
+  if (xTimerStart(job_timer, 0) != pdPASS) {
+      Serial.println("Failed to start NERDNOS timer");
+      return;
+  }
+
+  uint32_t extranonce_2 = 0;
+  unsigned long lastTempCheck = 0;
+
+  while(1) {
+    // wait for new job
+    while(!mMiner.newJob) {
+      vTaskDelay(100 / portTICK_PERIOD_MS);
+    }
+
+    mMiner.newJob = false; //Clear newJob flag
+    mMiner.inRun = true; //Set inRun flag
+
+    Serial.println(">>> STARTING TO HASH NONCES");
+    uint32_t startT = micros();
+
+    memset(asic_jobs, 0, sizeof(asic_jobs));
+
+    // we are assuming the version doesn't change from job to job
+    version = strtoul(mJob.version.c_str(), NULL, 16);
+
+    mMonitor.NerdStatus = NM_hashing;
+
+    uint32_t current_difficulty = 0;
+
+    while (mMiner.inRun) {
+      // wait for the timer to start a new job
+      // also yields the CPU
+      pthread_mutex_lock(&job_interval_mutex);
+      pthread_cond_wait(&job_interval_cond, &job_interval_mutex);
+      pthread_mutex_unlock(&job_interval_mutex);
+
+      // Temperature check
+      unsigned long currentTime = millis();
+      if (currentTime - lastTempCheck > TEMP_CHECK_INTERVAL) {
+        float currentTemp = nerdnos_get_temperature();  // Get ASIC temperature
+
+        if (currentTemp > MAX_SAFE_TEMP) {
+          gpio_set_level(NERD_NOS_GPIO_PEN, 0);  // Disable Buck
+          Serial.println("ASIC temperature too high. Disabling power.");
+
+          // Wait for temperature to drop
+          while (nerdnos_get_temperature() > (MAX_SAFE_TEMP - 15)) {  // 15 degree hysteresis
+            vTaskDelay(2000 / portTICK_PERIOD_MS);  // Check every 2 second
+          }
+
+          gpio_set_level(NERD_NOS_GPIO_PEN, 1);  // Enable Buck again
+          Serial.println("Temperature safe. Re-enabling ASIC.");
+          BM1397_init(200, 1); // Re-Init ASIC
+        }
+
+        lastTempCheck = currentTime;
+      }
+
+      // increment extranonce2
+      extranonce_2++;
+
+      // use extranonce2 as job id
+      uint8_t asic_job_id = (uint8_t) (extranonce_2 % ASIC_JOB_COUNT);
+
+#ifdef REQUEST_ASIC_HASHRATE
+      if (millis() - last_request_hashrate_ts > 2500) {
+        BM1397_read_hashrate();
+        last_request_hashrate_ts = millis();
+      }
+#endif
+
+
+      pthread_mutex_lock(&asic_job_mutexes[asic_job_id]);
+      // free memory if this slot was used before
+      safe_free_job(&asic_jobs[asic_job_id]);
+
+      // create the next asic job
+      // make sure that another task doesn't mess with the data while
+      // we are using it
+      pthread_mutex_lock(&job_mutex);
+      nerdnos_create_job(&mWorker, &mJob, &asic_jobs[asic_job_id], extranonce_2, mMiner.poolDifficulty);
+      pthread_mutex_unlock(&job_mutex);
+
+      // don't send difficulty while the job mutex is locked
+      if (current_difficulty != asic_jobs[asic_job_id].pool_diff) {
+        current_difficulty = asic_jobs[asic_job_id].pool_diff;
+        nerdnos_set_asic_difficulty(current_difficulty);
+        Serial.printf("Set difficulty to %lu\n", current_difficulty);
+      }
+
+      // send the job and
+      nerdnos_send_work(&asic_jobs[asic_job_id], asic_job_id);
+      pthread_mutex_unlock(&asic_job_mutexes[asic_job_id]);
+    }
+    Serial.println("MINER WORK ABORTED >> waiting new job");
+    mMiner.inRun = false;
+    uint32_t duration = micros() - startT;
+
+    // clean jobs
+    for (int i = 0; i < ASIC_JOB_COUNT; i++) {
+      safe_free_job(&asic_jobs[i]);
+    }
+
+/*
+    if (esp_task_wdt_reset() == ESP_OK)
+      Serial.print(">>> Resetting watchdog timer");
+*/
+  }
+
+}

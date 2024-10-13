@@ -3,13 +3,18 @@
 #ifdef T_DISPLAY
 
 #include <TFT_eSPI.h>
-#include "media/images_320_170.h"
 #include "media/myFonts.h"
 #include "media/Free_Fonts.h"
 #include "version.h"
 #include "monitor.h"
 #include "OpenFontRender.h"
 #include "rotation.h"
+
+#ifdef NERD_NOS
+  #include "media/images_NOS_320_170.h"
+#else
+  #include "media/images_320_170.h"
+#endif
 
 #define WIDTH 340
 #define HEIGHT 170
@@ -25,7 +30,7 @@ void tDisplay_Init(void)
     pinMode(PIN_ENABLE5V, OUTPUT);
     digitalWrite(PIN_ENABLE5V, HIGH);
 #endif
-  
+
   tft.init();
   #ifdef LILYGO_S3_T_EMBED
   tft.setRotation(ROTATION_270);
@@ -65,9 +70,14 @@ void tDisplay_MinerScreen(unsigned long mElapsed)
 
   // Print background screen
   background.pushImage(0, 0, MinerWidth, MinerHeight, MinerScreen);
-
+#ifdef NERD_NOS
+  Serial.printf(">>> Completed %s share(s), %s Khashes, avg. hashrate %s GH/s, vCore: %smV, temp: %s°C\n",
+                data.completedShares.c_str(), data.totalKHashes.c_str(), data.currentHashRate.c_str(),
+                data.vcore.c_str(), data.currentTemperature.c_str());
+#else
   Serial.printf(">>> Completed %s share(s), %s Khashes, avg. hashrate %s KH/s\n",
                 data.completedShares.c_str(), data.totalKHashes.c_str(), data.currentHashRate.c_str());
+#endif
 
   // Hashrate
   render.setFontSize(35);
@@ -211,7 +221,7 @@ void tDisplay_BTCprice(unsigned long mElapsed)
 {
   clock_data data = getClockData(mElapsed);
   data.currentDate ="01/12/2023";
-  
+
   //if(data.currentDate.indexOf("12/2023")>) { tDisplay_ChristmasContent(data); return; }
 
   // Print background screen
@@ -231,14 +241,14 @@ void tDisplay_BTCprice(unsigned long mElapsed)
   render.rdrawString(data.blockHeight.c_str(), 254, 138, TFT_WHITE);
 
   // Print Hour
-  
+
   background.setFreeFont(FSSB9);
   background.setTextSize(1);
   background.setTextDatum(TL_DATUM);
   background.setTextColor(TFT_BLACK);
   background.drawString(data.currentTime.c_str(), 222, 3, GFXFF);
 
-  // Print BTC Price 
+  // Print BTC Price
   background.setFreeFont(FF24);
   background.setTextDatum(TR_DATUM);
   background.setTextSize(1);
