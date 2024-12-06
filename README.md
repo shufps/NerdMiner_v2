@@ -1,3 +1,11 @@
+# For the latest NerdNOS firmware have a look here:
+https://github.com/WantClue/NerdMiner_v2/tree/nerdnos
+
+<br/>
+<br/>
+<br/>
+<br/>
+<br/>
 # NerdSoloMiner
 
 **The NerdSoloMiner v2**
